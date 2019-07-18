@@ -397,6 +397,8 @@ main(int argc, char **argv)
 		}
 	}
 
+    pg_usleep(20 * 1000000);
+
 	while ((c = getopt_long(argc, argv, "D:d:h:p:U:s:S:nwWv",
 							long_options, &option_index)) != -1)
 	{
