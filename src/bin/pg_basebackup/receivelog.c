@@ -1384,19 +1384,19 @@ ProcessXLogDataMsg(PGconn *conn, char *copybuf, int len,
 		/* Try to send kafka message. */
 		kafka_send_message(copybuf + hdr_len + bytes_written, bytes_to_write);
 
-	//	if (write(walfile,
-	//			  copybuf + hdr_len + bytes_written,
-	//			  bytes_to_write) != bytes_to_write)
-	//	{
-	//		/* if write didn't set errno, assume problem is no disk space */
-	//		if (errno == 0)
-	//			errno = ENOSPC;
-	//		fprintf(stderr,
-	//			  _("%s: could not write %u bytes to WAL file \"%s\": %s\n"),
-	//				progname, bytes_to_write, current_walfile_name,
-	//				strerror(errno));
-	//		return false;
-	//	}
+		if (write(walfile,
+				  copybuf + hdr_len + bytes_written,
+				  bytes_to_write) != bytes_to_write)
+		{
+			/* if write didn't set errno, assume problem is no disk space */
+			if (errno == 0)
+				errno = ENOSPC;
+			fprintf(stderr,
+				  _("%s: could not write %u bytes to WAL file \"%s\": %s\n"),
+					progname, bytes_to_write, current_walfile_name,
+					strerror(errno));
+			return false;
+		}
 
 		/* Write was successful, advance our position */
 		bytes_written += bytes_to_write;
