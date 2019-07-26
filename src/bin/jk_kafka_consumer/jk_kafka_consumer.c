@@ -1,3 +1,17 @@
+
+// ReadOneRecord and SimpleXLogPageRead taken from parsexlog.c
+/*-------------------------------------------------------------------------
+ *
+ * parsexlog.c
+ *	  Functions for reading Write-Ahead-Log
+ *
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *-------------------------------------------------------------------------
+ */
+
+// kafka send_message and its callback function takenfrom librdkafka
 /*
  * librdkafka - Apache Kafka C library
  *
@@ -49,9 +63,26 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "access/xlog_internal.h"
+#include "rmgrdesc.h"
 
-#define XLOG_BLCKSZ (8 * 1024)
-#define XLOG_SEG_SIZE (16 * 1024 * 1024)
+typedef struct JKXLogPrivate
+{
+    TimeLineID	timeline;
+    const char  *segment_buf;
+    XLogRecPtr	startptr;
+    XLogRecPtr	endptr;
+    bool		endptr_reached;
+} JKXLogPrivate;
+
+FILE *file;
+int total_bytes = 0;
+char *seg_buffer;
+char filename[MAXFNAMELEN];
+XLogReaderState *xlogreader;
+static XLogSegNo xlogreadsegno;
+static off_t seg_offset = 0;
+static off_t seg_flushed = 0;
+XLogRecPtr first_record = -1;
 
 static int run = 1;
 static rd_kafka_t *rk;
@@ -59,9 +90,151 @@ static int exit_eof = 0;
 static int wait_eof = 0;  /* number of partitions awaiting EOF */
 static int quiet = 0;
 static 	enum {
-	OUTPUT_HEXDUMP,
-	OUTPUT_RAW,
-} output = OUTPUT_HEXDUMP;
+    OUTPUT_HEXDUMP,
+    OUTPUT_RAW,
+    OUTPUT_QUIET,
+} output = OUTPUT_QUIET;
+
+
+void decode_and_write_message(rd_kafka_message_t *rkmessage);
+FILE *open_walfile(char *filename);
+void setXLogStartRecPtr(char *);
+static int JKReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
+                 XLogRecPtr targetPtr, char *readBuff, TimeLineID *curFileTLI);
+static void JKXLogRead(const char *directory, TimeLineID timeline_id,
+                 XLogRecPtr startptr, char *buf, Size count);
+
+
+void
+decode_and_write_message(rd_kafka_message_t *rkmessage)
+{
+    /* XLog Parsing and Decoding Suite. */
+
+    /* Add consumed messages into a one-segment-sized (16MB) buffer. */
+    if (seg_offset + rkmessage->len < XLOG_SEG_SIZE) {
+        memcpy(seg_buffer + seg_offset, rkmessage->payload, rkmessage->len);
+        seg_offset += rkmessage->len;
+    } else {
+        // TODO: Deal with moving the other bytes to a new buffer later?
+    }
+
+    /* Start decoding. */
+    XLogRecord *record;
+    char *errormsg;
+    const RmgrDescData *desc;
+
+    if (first_record == -1)
+    {
+        /* Setup first recptr to start reading from */
+		first_record = XLogFindNextRecord(xlogreader, ((JKXLogPrivate *) xlogreader->private_data)->startptr);
+    }
+
+    /* first_record is initially set to the very first record to read from.
+    * Here, it is currently hardcoded to 0/01000028.
+    * Subsequently, it will always be InvalidXLogRecPtr because XLogReader
+    * will continue reading from its internal last-read pointer. */
+	record = XLogReadRecord(xlogreader, first_record, &errormsg);
+	if (record != NULL) {
+		first_record = InvalidXLogRecPtr;
+    }
+
+//    if (record == NULL)
+//        // TODO: deal message not being valid anymore
+//        return;
+
+    while (record != NULL)
+    {
+		desc = &RmgrDescTable[record->xl_rmid];
+		if (!quiet)
+			printf("RMID=%s, lsn=%lX, TOTAL_LEN=%d\n", desc->rm_name, xlogreader->ReadRecPtr, record->xl_tot_len);
+		record = XLogReadRecord(xlogreader, first_record, &errormsg);
+    }
+
+    printf("seg-off: %lld", seg_offset);
+
+    /* write output to file. */
+	if (file != NULL) {
+		fwrite(seg_buffer+seg_flushed, seg_offset-seg_flushed, 1, file);
+		seg_flushed = seg_offset;
+    } else {
+        printf("No file given...\n");
+    }
+
+}
+
+
+/*
+ * XLogReader read_page callback
+ */
+static int
+JKReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
+                 XLogRecPtr targetPtr, char *readBuff, TimeLineID *curFileTLI)
+{
+    JKXLogPrivate *private = state->private_data;
+    int			count = XLOG_BLCKSZ;
+
+    if (private->endptr != InvalidXLogRecPtr)
+    {
+        if (targetPagePtr + XLOG_BLCKSZ <= private->endptr)
+            count = XLOG_BLCKSZ;
+        else if (targetPagePtr + reqLen <= private->endptr)
+            count = private->endptr - targetPagePtr;
+        else
+        {
+            private->endptr_reached = true;
+            return -1;
+        }
+    }
+
+    JKXLogRead(private->segment_buf, private->timeline, targetPagePtr,
+                     readBuff, count);
+
+    return count;
+}
+
+/*
+ * Read count bytes from a segment file in the specified directory, for the
+ * given timeline, containing the specified record pointer; store the data in
+ * the passed buffer.
+ */
+static void
+JKXLogRead(const char *segment_buf, TimeLineID timeline_id,
+                 XLogRecPtr startptr, char *buf, Size count)
+{
+    char	   *p;
+    XLogRecPtr	recptr;
+    Size		nbytes;
+
+    static uint32 sendOff = 0;
+
+    p = buf;
+    recptr = startptr;
+    nbytes = count;
+
+    while (nbytes > 0)
+    {
+        uint32		startoff;
+        int			segbytes;
+
+        startoff = recptr % XLogSegSize;
+
+        /* How many bytes are within this segment? */
+        if (nbytes > (XLogSegSize - startoff))
+            segbytes = XLogSegSize - startoff;
+        else
+            segbytes = nbytes;
+
+        /* Read contents of segment file into xlogreader buffer. */
+        memcpy(p, segment_buf+startoff, segbytes);
+
+        /* Update state for read */
+        recptr += segbytes;
+
+        sendOff += segbytes;
+        nbytes -= segbytes;
+        p += segbytes;
+    }
+}
 
 static void stop (int sig) {
         if (!run)
@@ -70,8 +243,42 @@ static void stop (int sig) {
 	fclose(stdin); /* abort fgets() */
 }
 
-FILE *file;
-int total_bytes = 0;
+/* Creates a file with name FILENAME and memsets all bytes to 0.
+ * Size of the file is exactly XLOG_SEG_SIZE. */
+FILE *
+open_walfile(char *filename)
+{
+    char        zerobuf[XLOG_BLCKSZ];
+    FILE        *fp;
+    int         bytes;
+
+    fp = fopen(filename, "wb");
+
+    /* New, empty, file. So pad it to 16Mb with zeroes */
+    memset(zerobuf, 0, XLOG_BLCKSZ);
+
+    for (bytes = 0; bytes < XLOG_SEG_SIZE; bytes += XLOG_BLCKSZ)
+    {
+        fwrite(zerobuf, XLOG_BLCKSZ, 1, fp);
+    }
+
+    fseek(fp, 0, SEEK_SET);
+
+    return fp;
+}
+
+/* TODO: This function will parse XLog files in XLOGDIR and find the last XLOG lsn written.
+ * The XLogRecPtr that immediately follows the last XLOG written will be set to be
+ * the global variable `first_record`, the first XLOG lsn for the xlogreader to read from. */
+void setXLogStartRecPtr(char *xlogdir)
+{
+	/* Setup the initial starting point of XLog receiving.
+	 * Currently hardcoded. */
+	// XLogSegNoOffsetToRecPtr(xlogreadsegno, seg_offset , private.startptr);
+
+	return;
+}
+
 
 static void hexdump (FILE *fp, const char *name, const void *ptr, size_t len) {
 	const char *p = (const char *)ptr;
@@ -103,34 +310,12 @@ static void hexdump (FILE *fp, const char *name, const void *ptr, size_t len) {
  * Kafka logger callback (optional)
  */
 static void logger (const rd_kafka_t *rk, int level,
-		    const char *fac, const char *buf) {
-	struct timeval tv;
-	gettimeofday(&tv, NULL);
-	fprintf(stdout, "%u.%03u RDKAFKA-%i-%s: %s: %s\n",
-		(int)tv.tv_sec, (int)(tv.tv_usec / 1000),
-		level, fac, rd_kafka_name(rk), buf);
-}
-
-FILE *
-open_walfile(char *filename)
-{
-    char        zerobuf[XLOG_BLCKSZ];
-    FILE        *fp;
-    int         bytes;
-
-    fp = fopen(filename, "wb");
-
-    /* New, empty, file. So pad it to 16Mb with zeroes */
-    memset(zerobuf, 0, XLOG_BLCKSZ);
-
-    for (bytes = 0; bytes < XLOG_SEG_SIZE; bytes += XLOG_BLCKSZ)
-    {
-        fwrite(zerobuf, XLOG_BLCKSZ, 1, fp);
-    }
-
-    fseek(fp, 0, SEEK_SET);
-
-    return fp;
+                    const char *fac, const char *buf) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    fprintf(stdout, "%u.%03u RDKAFKA-%i-%s: %s: %s\n",
+            (int)tv.tv_sec, (int)(tv.tv_usec / 1000),
+            level, fac, rd_kafka_name(rk), buf);
 }
 
 /**
@@ -184,30 +369,18 @@ static void msg_consume (rd_kafka_message_t *rkmessage) {
                         rkmessage->partition,
 			rkmessage->offset, rkmessage->len);
 
-	if (rkmessage->key_len) {
-		if (output == OUTPUT_HEXDUMP)
-			hexdump(stdout, "Message Key",
-				rkmessage->key, rkmessage->key_len);
-		else
-			printf("Key: %.*s\n",
-			       (int)rkmessage->key_len, (char *)rkmessage->key);
-	}
-
 	if (output == OUTPUT_HEXDUMP)
 		hexdump(stdout, "Message Payload",
 			rkmessage->payload, rkmessage->len);
-	else
+	else if (output == OUTPUT_RAW)
 		printf("%.*s\n",
 		       (int)rkmessage->len, (char *)rkmessage->payload);
-	if (file != NULL) {
-        // fprintf(file, "%s", (char *) rkmessage->payload);
-        // TODO: We would potentially have to split the stream of bytes into two separate wal files
-        // if we exceed segment size. We can make that change when we introduce the xlog record parsing logic here
 
-        fwrite(rkmessage->payload, rkmessage->len, 1, file);
-        XLogRecPtr test = 0L;
-		total_bytes += (int) rkmessage->len;
-	}
+
+	/* Record total number of bytes consumed. */
+    total_bytes += (int) rkmessage->len;
+
+    decode_and_write_message(rkmessage);
 }
 
 
@@ -256,57 +429,6 @@ static void rebalance_cb (rd_kafka_t *rk,
 	}
 }
 
-
-static int describe_groups (rd_kafka_t *rk, const char *group) {
-        rd_kafka_resp_err_t err;
-        const struct rd_kafka_group_list *grplist;
-        int i;
-
-        err = rd_kafka_list_groups(rk, group, &grplist, 10000);
-
-        if (err) {
-                fprintf(stderr, "%% Failed to acquire group list: %s\n",
-                        rd_kafka_err2str(err));
-                return -1;
-        }
-
-        for (i = 0 ; i < grplist->group_cnt ; i++) {
-                const struct rd_kafka_group_info *gi = &grplist->groups[i];
-                int j;
-
-                printf("Group \"%s\" in state %s on broker %d (%s:%d)\n",
-                       gi->group, gi->state,
-                       gi->broker.id, gi->broker.host, gi->broker.port);
-                if (gi->err)
-                        printf(" Error: %s\n", rd_kafka_err2str(gi->err));
-                printf(" Protocol type \"%s\", protocol \"%s\", "
-                       "with %d member(s):\n",
-                       gi->protocol_type, gi->protocol, gi->member_cnt);
-
-                for (j = 0 ; j < gi->member_cnt ; j++) {
-                        const struct rd_kafka_group_member_info *mi;
-                        mi = &gi->members[j];
-
-                        printf("  \"%s\", client id \"%s\" on host %s\n",
-                               mi->member_id, mi->client_id, mi->client_host);
-                        printf("    metadata: %d bytes\n",
-                               mi->member_metadata_size);
-                        printf("    assignment: %d bytes\n",
-                               mi->member_assignment_size);
-                }
-                printf("\n");
-        }
-
-        if (group && !grplist->group_cnt)
-                fprintf(stderr, "%% No matching group (%s)\n", group);
-
-        rd_kafka_group_list_destroy(grplist);
-
-        return 0;
-}
-
-
-
 static void sig_usr1 (int sig) {
 	rd_kafka_dump(stdout, rk);
 }
@@ -318,22 +440,36 @@ int main (int argc, char **argv) {
 	rd_kafka_conf_t *conf;
 	rd_kafka_topic_conf_t *topic_conf;
 	char errstr[512];
-	const char *debug = NULL;
-	int do_conf_dump = 0;
 	char tmp[16];
-        rd_kafka_resp_err_t err;
-        char *group = NULL;
-        rd_kafka_topic_partition_list_t *topics;
-        int is_subscription;
-        int i;
+    rd_kafka_resp_err_t err;
+    char *group = NULL;
+    rd_kafka_topic_partition_list_t *topics;
+    int is_subscription;
+    int i;
+
+	/* XLogReader Related stuff. */
+	seg_buffer = calloc(1, XLOG_SEG_SIZE);
+	JKXLogPrivate private;
+
+	/* Create XLogReaderState. */
+	xlogreader = XLogReaderAllocate(&JKReadPage, &private);
+	if (xlogreader == NULL)
+		// pg_fatal("out of memory\n");
+		printf("Out of memory\n");
+
+	/* Setup xlogreader private. */
+	private.segment_buf = seg_buffer;
+
+	/* End of XLogReader Related stuff. */
+
 
 	quiet = !isatty(STDIN_FILENO);
 
 	/* Kafka configuration */
 	conf = rd_kafka_conf_new();
 
-        /* Set logger */
-        rd_kafka_conf_set_log_cb(conf, logger);
+    /* Set logger */
+    rd_kafka_conf_set_log_cb(conf, logger);
 
 	/* Quick termination */
 	snprintf(tmp, sizeof(tmp), "%i", SIGIO);
@@ -342,116 +478,43 @@ int main (int argc, char **argv) {
 	/* Topic configuration */
 	topic_conf = rd_kafka_topic_conf_new();
 
-	while ((opt = getopt(argc, argv, "f:g:b:qd:eX:ADO")) != -1) {
+	while ((opt = getopt(argc, argv, "f:s:g:b:q:HR")) != -1) {
 		switch (opt) {
 		case 'b':
 			brokers = optarg;
 			break;
-                case 'g':
-                        group = optarg;
-                        break;
-		case 'e':
-			exit_eof = 1;
-			break;
+        case 'g':
+                group = optarg;
+                break;
 		case 'f':
 			file = open_walfile(optarg); // fopen(optarg, "wb");
+			xlogreadsegno = 5L;
 			break;
-		case 'd':
-			debug = optarg;
+		case 's':
+			if (sscanf(optarg, "%lu", &xlogreadsegno) != 1) {
+				fprintf(stderr, "failed to get segment number\n");
+			}
+			XLogFileName(filename, 1, xlogreadsegno);
+			file = open_walfile(filename);
 			break;
 		case 'q':
 			quiet = 1;
 			break;
-		case 'A':
-			output = OUTPUT_RAW;
+		case 'H':
+			output = OUTPUT_HEXDUMP;
 			break;
-		case 'X':
-		{
-			char *name, *val;
-			rd_kafka_conf_res_t res;
-
-			if (!strcmp(optarg, "list") ||
-			    !strcmp(optarg, "help")) {
-				rd_kafka_conf_properties_show(stdout);
-				exit(0);
-			}
-
-			if (!strcmp(optarg, "dump")) {
-				do_conf_dump = 1;
-				continue;
-			}
-
-			name = optarg;
-			if (!(val = strchr(name, '='))) {
-				fprintf(stderr, "%% Expected "
-					"-X property=value, not %s\n", name);
-				exit(1);
-			}
-
-			*val = '\0';
-			val++;
-
-			res = RD_KAFKA_CONF_UNKNOWN;
-			/* Try "topic." prefixed properties on topic
-			 * conf first, and then fall through to global if
-			 * it didnt match a topic configuration property. */
-			if (!strncmp(name, "topic.", strlen("topic.")))
-				res = rd_kafka_topic_conf_set(topic_conf,
-							      name+
-							      strlen("topic."),
-							      val,
-							      errstr,
-							      sizeof(errstr));
-
-			if (res == RD_KAFKA_CONF_UNKNOWN)
-				res = rd_kafka_conf_set(conf, name, val,
-							errstr, sizeof(errstr));
-
-			if (res != RD_KAFKA_CONF_OK) {
-				fprintf(stderr, "%% %s\n", errstr);
-				exit(1);
-			}
-		}
-		break;
-
-                case 'D':
-                case 'O':
-                        mode = opt;
-                        break;
-
+        case 'R':
+            output = OUTPUT_RAW;
+            break;
 		default:
 			goto usage;
 		}
 	}
 
+	/* Setup the initial starting point of XLog receiving. */
+    XLogSegNoOffsetToRecPtr(xlogreadsegno, seg_offset , private.startptr);
 
-	if (do_conf_dump) {
-		const char **arr;
-		size_t cnt;
-		int pass;
-
-		for (pass = 0 ; pass < 2 ; pass++) {
-			if (pass == 0) {
-				arr = rd_kafka_conf_dump(conf, &cnt);
-				printf("# Global config\n");
-			} else {
-				printf("# Topic config\n");
-				arr = rd_kafka_topic_conf_dump(topic_conf,
-							       &cnt);
-			}
-
-			for (i = 0 ; i < (int)cnt ; i += 2)
-				printf("%s = %s\n",
-				       arr[i], arr[i+1]);
-
-			printf("\n");
-
-			rd_kafka_conf_dump_free(arr, cnt);
-		}
-
-		exit(0);
-	}
-
+	/* End of XLogReader setup. */
 
 	if (strchr("OC", mode) && optind == argc) {
 	usage:
@@ -461,24 +524,14 @@ int main (int argc, char **argv) {
 			"librdkafka version %s (0x%08x)\n"
 			"\n"
 			" Options:\n"
-			"  -f <filename>   output file\n"
-                        "  -g <group>      Consumer group (%s)\n"
+			"  -f <filename>   output file name. Assumes segment number is 5.\n"
+			"  -s <seg_no>     segment number to start reading from (not filename). Sets output filename to segment.\n"
+            "  -g <group>      Consumer group (%s)\n"
 			"  -b <brokers>    Broker address (%s)\n"
-			"  -e              Exit consumer when last message\n"
-			"                  in partition has been received.\n"
-                        "  -D              Describe group.\n"
-                        "  -O              Get commmitted offset(s)\n"
-			"  -d [facs..]     Enable debugging contexts:\n"
-			"                  %s\n"
+
 			"  -q              Be quiet\n"
-			"  -A              Raw payload output (consumer)\n"
-			"  -X <prop=name> Set arbitrary librdkafka "
-			"configuration property\n"
-			"               Properties prefixed with \"topic.\" "
-			"will be set on topic object.\n"
-			"               Use '-X list' to see the full list\n"
-			"               of supported properties.\n"
-			"\n"
+            "  -H              Hexdump payload output (consumer)\n"
+			"  -R              Raw payload output (consumer)\n"
                         "For balanced consumer groups use the 'topic1 topic2..'"
                         " format\n"
                         "and for static assignment use "
@@ -486,22 +539,13 @@ int main (int argc, char **argv) {
 			"\n",
 			argv[0],
 			rd_kafka_version_str(), rd_kafka_version(),
-                        group, brokers,
-			RD_KAFKA_DEBUG_CONTEXTS);
+                        group, brokers);
 		exit(1);
 	}
-
 
 	signal(SIGINT, stop);
 	signal(SIGUSR1, sig_usr1);
 
-	if (debug &&
-	    rd_kafka_conf_set(conf, "debug", debug, errstr, sizeof(errstr)) !=
-	    RD_KAFKA_CONF_OK) {
-		fprintf(stderr, "%% Debug configuration failed: %s: %s\n",
-			errstr, debug);
-		exit(1);
-	}
 
         /*
          * Client/Consumer group
@@ -553,15 +597,6 @@ int main (int argc, char **argv) {
         }
 
 
-        if (mode == 'D') {
-                int r;
-                /* Describe groups */
-                r = describe_groups(rk, group);
-
-                rd_kafka_destroy(rk);
-                exit(r == -1 ? 1 : 0);
-        }
-
         /* Redirect rd_kafka_poll() to consumer_poll() */
         rd_kafka_poll_set_consumer(rk);
 
@@ -582,38 +617,6 @@ int main (int argc, char **argv) {
 
                 rd_kafka_topic_partition_list_add(topics, topic, partition);
         }
-
-        if (mode == 'O') {
-                /* Offset query */
-
-                err = rd_kafka_committed(rk, topics, 5000);
-                if (err) {
-                        fprintf(stderr, "%% Failed to fetch offsets: %s\n",
-                                rd_kafka_err2str(err));
-                        exit(1);
-                }
-
-                for (i = 0 ; i < topics->cnt ; i++) {
-                        rd_kafka_topic_partition_t *p = &topics->elems[i];
-                        printf("Topic \"%s\" partition %"PRId32,
-                               p->topic, p->partition);
-                        if (p->err)
-                                printf(" error %s",
-                                       rd_kafka_err2str(p->err));
-                        else {
-                                printf(" offset %"PRId64"",
-                                       p->offset);
-
-                                if (p->metadata_size)
-                                        printf(" (%d bytes of metadata)",
-                                               (int)p->metadata_size);
-                        }
-                        printf("\n");
-                }
-
-                goto done;
-        }
-
 
         if (is_subscription) {
                 fprintf(stderr, "%% Subscribing to %d topics\n", topics->cnt);
@@ -644,18 +647,17 @@ int main (int argc, char **argv) {
                 }
         }
 
-done:
-        err = rd_kafka_consumer_close(rk);
-        if (err)
-                fprintf(stderr, "%% Failed to close consumer: %s\n",
-                        rd_kafka_err2str(err));
-        else
-                fprintf(stderr, "%% Consumer closed\n");
+    err = rd_kafka_consumer_close(rk);
+    if (err)
+            fprintf(stderr, "%% Failed to close consumer: %s\n",
+                    rd_kafka_err2str(err));
+    else
+            fprintf(stderr, "%% Consumer closed\n");
 
-        rd_kafka_topic_partition_list_destroy(topics);
+    rd_kafka_topic_partition_list_destroy(topics);
 
-        /* Destroy handle */
-        rd_kafka_destroy(rk);
+    /* Destroy handle */
+    rd_kafka_destroy(rk);
 
 	/* Let background threads clean up and terminate cleanly. */
 	run = 5;
