@@ -12390,6 +12390,30 @@ wait_for_mirror()
 }
 
 /*
+ * Write a CLUSTER CONSISTENT REPLAY POINT record
+ */
+XLogRecPtr
+XLogClusterConsistentReplayPoint(const char *rpName)
+{
+	XLogRecPtr	RecPtr;
+	xl_restore_point xlrec;
+
+	xlrec.rp_time = GetCurrentTimestamp();
+	strncpy(xlrec.rp_name, rpName, MAXFNAMELEN);
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) (&xlrec), sizeof(xl_restore_point));
+
+	RecPtr = XLogInsert(RM_XLOG_ID, XLOG_CONSISTENCY_POINT);
+
+	ereport(LOG,
+			(errmsg("replay point \"%s\" created at %X/%X",
+					rpName, (uint32) (RecPtr >> 32), (uint32) RecPtr)));
+
+	return RecPtr;
+}
+
+/*
  * Check to see if we're a mirror, and if we are: (1) Assume that we are
  * running as superuser; (2) No data pages need to be accessed by this backend
  * - no snapshot / transaction needed.

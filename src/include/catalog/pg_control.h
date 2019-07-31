@@ -82,6 +82,7 @@ typedef struct CheckPoint
 #define XLOG_FPI_FOR_HINT				0xA0
 #define XLOG_FPI						0xB0
 #define XLOG_NEXTRELFILENODE			0xC0
+#define XLOG_CONSISTENCY_POINT			0xD0
 
 
 /*

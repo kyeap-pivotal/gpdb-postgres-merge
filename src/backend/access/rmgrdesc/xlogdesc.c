@@ -215,6 +215,13 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 						 xlrec.ThisTimeLineID, xlrec.PrevTimeLineID,
 						 timestamptz_to_str(xlrec.end_time));
 	}
+	else if (info == XLOG_CONSISTENCY_POINT)
+	{
+		xl_restore_point xlrec;
+
+		memcpy(&xlrec, rec, sizeof(xl_restore_point));
+		appendStringInfo(buf, "rp_time = %s; rp_name = %s", timestamptz_to_str(xlrec.rp_time), xlrec.rp_name);
+	}
 }
 
 const char *
@@ -262,6 +269,9 @@ xlog_identify(uint8 info)
 			break;
 		case XLOG_FPI_FOR_HINT:
 			id = "FPI_FOR_HINT";
+			break;
+		case XLOG_CONSISTENCY_POINT:
+			id = "CONSISTENCY_POINT";
 			break;
 	}
 

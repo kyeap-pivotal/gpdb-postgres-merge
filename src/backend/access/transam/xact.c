@@ -2764,6 +2764,8 @@ CommitTransaction(void)
 	 */
 	s->state = TRANS_COMMIT;
 
+	LWLockAcquire(TwophaseCommitLock, LW_SHARED);
+
 	if (!is_parallel_worker)
 	{
 		/*
@@ -2824,6 +2826,8 @@ CommitTransaction(void)
 		 */
 		ProcArrayEndTransaction(MyProc, latestXid, false);
 	}
+
+	LWLockRelease(TwophaseCommitLock);
 
 	/*
 	 * This is all post-commit cleanup.  Note that if an error is raised here,
