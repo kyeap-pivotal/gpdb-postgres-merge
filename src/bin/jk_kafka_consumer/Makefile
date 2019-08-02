@@ -10,6 +10,8 @@ include $(top_builddir)/src/Makefile.global
 OBJS = jk_kafka_consumer.o compat.o xlogreader.o rmgrdesc.o \
 	$(RMGRDESCOBJS) $(WIN32RES)
 
+OBJS += kafka_pipe_consumer.o
+
 override CPPFLAGS := -DFRONTEND $(CPPFLAGS)
 LDFLAGS += -lrdkafka
 
