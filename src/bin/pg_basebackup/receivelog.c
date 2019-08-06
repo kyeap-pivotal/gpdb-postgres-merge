@@ -16,6 +16,7 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include <libgen.h>
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
 #endif
@@ -65,7 +66,7 @@ static long CalculateCopyStreamSleeptime(int64 now, int standby_message_timeout,
 static bool ReadEndOfStreamingResult(PGresult *res, XLogRecPtr *startpos,
 						 uint32 *timeline);
 
-static bool kafka_send_message(char *copybuf, int bytes_to_write);
+static bool kafka_send_message(char *copybuf, int bytes_to_write, const char *topic);
 
 static bool
 mark_file_as_archived(const char *basedir, const char *fname)
@@ -1150,7 +1151,7 @@ static void dr_msg_cb (rd_kafka_t *rk,
 }
 
 static bool
-kafka_send_message(char *copybuf, int bytes_to_write) {
+kafka_send_message(char *copybuf, int bytes_to_write, const char *name) {
     /* Kafka test start. */
     rd_kafka_t *rk; /* Producer instance handle */
     rd_kafka_topic_t *rkt; /* Topic object */
@@ -1160,7 +1161,7 @@ kafka_send_message(char *copybuf, int bytes_to_write) {
     const char *topic; /* Argument: topic to produce to */
 
     brokers = "localhost:9092";
-    topic = "gptest";
+    topic = name;
 
     conf = rd_kafka_conf_new();
 
@@ -1356,6 +1357,10 @@ ProcessXLogDataMsg(PGconn *conn, char *copybuf, int len,
 	bytes_left = len - hdr_len;
 	bytes_written = 0;
 
+	// TODO: WRITE THIS DOWN TO NOT FORGET;
+    const char *topic = basename(basedir);
+    printf("\n\n%s\n\n\n", topic);
+
 	while (bytes_left)
 	{
 		int			bytes_to_write;
@@ -1382,7 +1387,7 @@ ProcessXLogDataMsg(PGconn *conn, char *copybuf, int len,
 		errno = 0;
 
 		/* Try to send kafka message. */
-		kafka_send_message(copybuf + hdr_len + bytes_written, bytes_to_write);
+		kafka_send_message(copybuf + hdr_len + bytes_written, bytes_to_write, topic);
 
 		if (write(walfile,
 				  copybuf + hdr_len + bytes_written,
