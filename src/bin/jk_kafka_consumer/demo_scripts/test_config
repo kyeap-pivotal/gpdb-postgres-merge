@@ -1,0 +1,8 @@
+localhost:9092
+4
+master 5 /tmp/remote_datadirs/master/
+primary1 5 /tmp/remote_datadirs/primary1/
+primary2 5 /tmp/remote_datadirs/primary2/
+primary3 5 /tmp/remote_datadirs/primary3/
+
+
