@@ -19,6 +19,8 @@ pg_basebackup --xlog-method=stream -R -c fast -D $REMOTEDATADIR/primary2 -h "$(h
 pg_basebackup --xlog-method=stream -R -c fast -D $REMOTEDATADIR/primary3 -h "$(hostname)" -p 25434 --target-gp-dbid 7
 pg_basebackup --xlog-method=stream -R -c fast -D $REMOTEDATADIR/master -h "$(hostname)" -p 15432 --target-gp-dbid 8
 
+sleep 5s
+
 # Change all remote recovery.confs have primaryconninfo as blank.
 for dir in primary1 primary2 primary3 master; do
   sed -i'' -e "s/primary_conninfo.*/primary_conninfo = ''/" $REMOTEDATADIR/$dir/recovery.conf
