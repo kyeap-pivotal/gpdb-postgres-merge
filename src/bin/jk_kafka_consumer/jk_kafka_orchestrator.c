@@ -345,7 +345,6 @@ void
 run_consumer(int identifier)
 {
 
-	sleep(10);
 	fprintf(stdout, "child routine for segment %d started.\n", identifier);
 
 	/* Setup replication info. */
