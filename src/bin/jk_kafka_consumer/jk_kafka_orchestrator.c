@@ -201,6 +201,7 @@ decode_message(int seg_id, int *counter, char * fname, char *seg_buffer, XLogRea
 			staging_file = open_walfile(staging_name);
 			fwrite(seg_buffer, 1, XLOG_SEG_SIZE, staging_file);
 			fclose(staging_file);
+			fprintf(stdout, "Segment %d wrote staging file to %s.\n", seg_id, staging_name);
             *counter += 1;
         }
 
@@ -299,14 +300,17 @@ open_walfile(char *filename)
 	int			bytes;
 
 	fp = fopen(filename, "wb");
+	fprintf(stdout, "Opened file %s.\n", filename);
 
 	/* New, empty, file. So pad it to 16Mb with zeroes */
 	memset(zerobuf, 0, XLOG_BLCKSZ);
 
 	for (bytes = 0; bytes < XLOG_SEG_SIZE; bytes += XLOG_BLCKSZ)
 	{
-		fwrite(zerobuf, XLOG_BLCKSZ, 1, fp);
+		fwrite(zerobuf, 1, XLOG_BLCKSZ, fp);
 	}
+
+	fprintf(stdout, "Zero_paded file %s.\n", filename);
 
 	fseek(fp, 0, SEEK_SET);
 
@@ -387,7 +391,7 @@ run_consumer(int identifier)
 
     /* Create staging path. */
     strcpy(staging_path, flushpath);
-	
+
 	strcat(flushpath, filename);
 
     fprintf(stdout, "child routine for segment %d ready to start decoding.\n", identifier);
@@ -465,7 +469,7 @@ run_consumer(int identifier)
 
 			/* TODO: Check to flush. This is where the consistency points are tried. */
 			// consistency_flush_check(seg_buffer, )
-			
+
 			/* TODO: This is a temprary hacky solution to flush entire buffer to segfile. */
 			// fwrite(seg_buffer, 1, XLOG_SEG_SIZE, fp);
 			// fseek(fp, 0, SEEK_SET);
@@ -524,7 +528,7 @@ print_help(void)
 // 			*tail = NULL;
 // 	bool		recoveryTargetActionSet = false;
 // 	char *data;
-// 
+//
 // 	fd = AllocateFile(RECOVERY_CONFIG_FILE, "r");
 // 	if (fd == NULL)
 // 	{
@@ -535,15 +539,15 @@ print_help(void)
 // 						errmsg("could not open recovery command file \"%s\": %m",
 // 							   RECOVERY_CONFIG_FILE)));
 // 	}
-// 
+//
 // 	/*
 // 	 * Since we're asking ParseConfigFp() to report errors as FATAL, there's
 // 	 * no need to check the return value.
 // 	 */
 // 	(void) ParseConfigFp(fd, RECOVERY_CONFIG_FILE, 0, FATAL, &head, &tail);
-// 
+//
 // 	FreeFile(fd);
-// 
+//
 // 	for (item = head; item; item = item->next)
 // 	{
 // 		if (strcmp(item->name, "hi") == 0)
@@ -609,7 +613,7 @@ main(int argc, char **argv)
 	{
 		seg_topics[i] = malloc(sizeof(char) * MAXTOPICSIZE);
 		seg_basedirs[i] = malloc(sizeof(char) * MAXBASEDIRSIZE);
-	
+
 		fscanf(conf, "%s %lu %s", seg_topics[i], &xlog_start_segnos[i], seg_basedirs[i]);
 		fprintf(stdout, "new segment; topic: %s, startsegno: %lu, basedir: %s\n",
 				seg_topics[i], xlog_start_segnos[i], seg_basedirs[i]);
@@ -645,19 +649,25 @@ main(int argc, char **argv)
 		}
 	}
 
+	/* This sleep was introduced because directly lldbing into the orchestrator somehow
+	 * stopped any of the child processes to run any polling (presumabely by sending them SIGSTOPS)
+	 * So I lldb'd into the sleeping master process instead. */
+	// sleep(100);
+
 	/* Main orchestration Loop. */
 	int seg_id = -1;
 	int cp_num; /* cp from the segment file. */
 	int curr_cp = 0; /* What we are expecting. */
 	int count = 0;
     char filename_prefix[MAXBASEDIRSIZE];
+    char filename_cpy[MAXBASEDIRSIZE];
     char move_dir[MAXBASEDIRSIZE];
     char *staged_files[num_segs];
+	char *saveptr;
     for (i = 0; i < num_segs; i++)
     {
         staged_files[i] = malloc(sizeof(char)*MAXBASEDIRSIZE);
     }
-
 
     /* Open staging directory to look for files to push. */
     DIR *d;
@@ -667,25 +677,26 @@ main(int argc, char **argv)
         d = opendir(staging_dir);
         if (d)
         {
+			count = 0;
             while ((dir = readdir(d)) != NULL)
             {
                 if(strcmp(dir->d_name, ".") == 0 ||
                     strcmp(dir->d_name, "..") == 0)
                     continue;
 
-                strcpy(filename_prefix, strtok_r(dir->d_name, ":", &dir->d_name));
-                seg_id = atoi(strtok_r(dir->d_name, ":", &dir->d_name));
-                cp_num = atoi(strtok_r(dir->d_name, ":", &dir->d_name));
+				strcpy(filename_cpy, dir->d_name);
+				strcpy(filename_prefix, strtok_r(filename_cpy, ":", &saveptr));
+				seg_id = atoi(strtok_r(NULL, ":", &saveptr));
+				cp_num = atoi(strtok_r(NULL, ":", &saveptr));
 
 //                sscanf(dir->d_name, "%s:%d:%d", &filename_prefix,
 //                       &seg_id, &cp_num);
-                fprintf(stdout, "\n\n %s, %d: %d\n\n\n", filename_prefix, seg_id, cp_num);
-                fprintf(stdout, "Processing seg file: %s\n", dir->d_name);
+                // fprintf(stdout, "Processing seg file: %s\n", dir->d_name);
                 if (cp_num == curr_cp)
                 {
                     /* Add all the seg files to staged_files. */
                     strncpy(staged_files[seg_id], dir->d_name, strlen(dir->d_name)+1);
-                    fprintf(stdout, "Added file: %s to candidate set\n", staged_files[seg_id]);
+                    // fprintf(stdout, "Added file: %s to candidate set\n", staged_files[seg_id]);
                     count++;
                 }
             }
@@ -697,16 +708,18 @@ main(int argc, char **argv)
 
             for (i = 0; i < num_segs; i++)
             {
+				/* Create filename to be moved by prepending staging directory. */
+				char movename[MAXBASEDIRSIZE];
+				strcpy(movename, staging_dir);
+				strcat(movename, staged_files[i]);
                 sprintf(move_dir, "%s/%s", seg_basedirs[i], filename_prefix);
                 fprintf(stdout, "Moving segment %d staged file %s to %s\n", i, staged_files[i], move_dir);
-                rename(staged_files[i], move_dir);
+                rename(movename, move_dir);
             }
 
             curr_cp++;
         }
         sleep(0.1);
-
-        count = 0;
     }
 	return 0;
 }
