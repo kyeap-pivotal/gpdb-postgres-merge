@@ -12,13 +12,6 @@
 # Primary3 on xlogsegment 5
 # ??????????????????????????????????? ok i guess it changes everytime.
 
-# clean up residue and initialize
-rm -rf /tmp/remote_sink/*
-mkdir -p /tmp/remote_sink/master
-mkdir -p /tmp/remote_sink/primary1
-mkdir -p /tmp/remote_sink/primary2
-mkdir -p /tmp/remote_sink/primary3
-
 # run receivexlog on background.
 # kafka topics will be basenames, namely master, primary1, primary2, primary3
 pg_receivexlog -p 15432 -D /tmp/remote_sink/master &
