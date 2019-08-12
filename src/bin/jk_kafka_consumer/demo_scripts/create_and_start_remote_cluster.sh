@@ -14,16 +14,20 @@ rm -rf $REMOTEDATADIR
 
 # Run pg_basebackup on source cluster to create remote cluster.
 mkdir -p $REMOTEDATADIR
-pg_basebackup --xlog-method=stream -R -c fast -D $REMOTEDATADIR/primary1 -h "$(hostname)" -p 25432 --target-gp-dbid 5
-pg_basebackup --xlog-method=stream -R -c fast -D $REMOTEDATADIR/primary2 -h "$(hostname)" -p 25433 --target-gp-dbid 6
-pg_basebackup --xlog-method=stream -R -c fast -D $REMOTEDATADIR/primary3 -h "$(hostname)" -p 25434 --target-gp-dbid 7
-pg_basebackup --xlog-method=stream -R -c fast -D $REMOTEDATADIR/master -h "$(hostname)" -p 15432 --target-gp-dbid 8
+pg_basebackup -Fp -x -D $REMOTEDATADIR/primary1 -h "$(hostname)" -p 25432 --target-gp-dbid 5
+pg_basebackup -Fp -x -D $REMOTEDATADIR/primary2 -h "$(hostname)" -p 25433 --target-gp-dbid 6
+pg_basebackup -Fp -x -D $REMOTEDATADIR/primary3 -h "$(hostname)" -p 25434 --target-gp-dbid 7
+pg_basebackup -Fp -x -D $REMOTEDATADIR/master -h "$(hostname)" -p 15432 --target-gp-dbid 8
 
 sleep 5s
 
 # Change all remote recovery.confs have primaryconninfo as blank.
 for dir in primary1 primary2 primary3 master; do
-  sed -i'' -e "s/primary_conninfo.*/primary_conninfo = ''/" $REMOTEDATADIR/$dir/recovery.conf
+  touch $REMOTEDATADIR/$dir/recovery.conf
+  echo "standby_mode = 'on'
+restore_command = 'cp $REMOTEDATADIR/$dir/pg_xlog/%f \"%p\"'
+primary_conninfo = ''" >> $REMOTEDATADIR/$dir/recovery.conf
+#   sed -i'' -e "s/primary_conninfo.*/primary_conninfo = ''/" $REMOTEDATADIR/$dir/recovery.conf
 done
 
 # Change all remote segments' ports to be different from the original segments' ports.
@@ -41,3 +45,16 @@ $GPHOME/bin/postgres -D $REMOTEDATADIR/primary1/ -i -p 27432 &
 $GPHOME/bin/postgres -D $REMOTEDATADIR/primary2/ -i -p 27433 &
 $GPHOME/bin/postgres -D $REMOTEDATADIR/primary3/ -i -p 27434 &
 
+
+# # start remote master (demo, will be on already) (on background) (system will start in master-only utility mode)
+# $GPHOME/bin/postgres -D $REMOTEDATADIR/master/ -p 17432 -c gp_role=utility &
+
+# # start remote primaries (demo, will be on already) (on background)
+# $GPHOME/bin/postgres -D $REMOTEDATADIR/primary1/ -i -p 27432 &
+# $GPHOME/bin/postgres -D $REMOTEDATADIR/primary2/ -i -p 27433 &
+# $GPHOME/bin/postgres -D $REMOTEDATADIR/primary3/ -i -p 27434 &
+
+
+
+# BIG BAD! apparently even though I set the primary_conninfo to be empty, the new cluster interacts
+# with the original cluster and gets the data! what???
