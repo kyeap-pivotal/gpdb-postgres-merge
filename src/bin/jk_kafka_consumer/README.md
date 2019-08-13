@@ -66,3 +66,18 @@ This was hard.
     - In the case where the backup was made with the `-R` flag, an intermediate `recovery.conf-e` file seems to be made with the `primary_conninfo='original segment'`.
     - In the case where the backup was created without the `-R` flag, no new file is made but the original segment's WAL is still streamed.
     - !!! Possibly check the hba.conf's replication something field to see where this unwanted behavior is coming from.
+      - Deleting all the lines containing `replication` in the `pg_hba.conf` does not fix the issue. Instead, it seems to also lead to the creation of a `pg_hba.conf-e` file that contains all the original replication info.
+      - Offending log: `2019-08-13 11:45:53.083255 PDT,,,p86160,th-1462742144,,,,0,,,seg-1,,,,,"LOG","00000","started streaming WAL from primary at 0/18000000 on timeline 1",,,,,,,0,,"walreceiver.c",373,`
+      - This seems to mean that there is a walreceiver that was spun up.
+      - `ps -ef | grep receive` gives:
+  ```  501 86160 86091   0 11:45AM ??         0:00.49 postgres: 17432, wal receiver process   streaming 0/18050E70
+  501 95912 86094   0 11:58AM ??         0:00.00 postgres: 27434, wal receiver process
+  501 95913 86092   0 11:58AM ??         0:00.00 postgres: 27432, wal receiver process
+  501 95914 86093   0 11:58AM ??         0:00.00 postgres: 27433, wal receiver process
+  ```
+      - which is not good.
+
+
+
+## Conclusion
+The streaming works, it just gets hindered by the seemingly remaining connection between the original cluster and the remote cluster.
