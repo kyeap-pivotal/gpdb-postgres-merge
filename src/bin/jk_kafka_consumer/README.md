@@ -3,7 +3,7 @@
 
 
 ## How to Run.
-0. Make sure you have cloned this repository.
+0. Make sure you have cloned this repository, and have a kafka (zookeeper and server) configuration running.
 
 1. Run `make` and `make install` on `src/bin/jk_kafka_consumer` and `src/bin/pg_basebackup`
     - On MacOS: if there is a compilation failure, first run `brew install librdkafka`. Then, to the `Makefile` of both of the above directories, add `CFLAGS += -I/usr/local/Cellar/librdkafka/1.1.0/include/`
